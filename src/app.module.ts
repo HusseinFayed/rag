@@ -12,13 +12,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
       // entities: [join(__dirname, '**', '*.entity{.ts,.js}')], // Adjust the path to your entities
       // synchronize: true, // Set to false in production
 
-      // type: 'postgres',
-      // url:"postgresql://neondb_owner:MleHkuZ4o2dO@ep-blue-flower-a2jsrbje.eu-central-1.aws.neon.tech/neondb?sslmode=require",
-      // entities: ['dist/**/*.entity{.ts,.js}'],
-      // synchronize: true,
-      // autoLoadEntities: true,
-      // logging: false,
-      // logger: 'advanced-console'
+      
 
       type: 'postgres',
       url:"postgres://postgres:0000@localhost:5432/matches",
