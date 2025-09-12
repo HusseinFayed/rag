@@ -3,7 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { AddedTeamsCount } from 'src/entities/addTeamsCount.entity';
 import { Matches } from 'src/entities/matches.entity';
 import { Teams } from 'src/entities/teams.entity';
-import { Repository } from 'typeorm';
+import { ILike, Repository } from 'typeorm';
 
 export interface DatabaseQueryDto {
   question: string;
@@ -21,7 +21,7 @@ export class DatabaseQueryService {
     private readonly matchesRepository: Repository<Matches>,
     @InjectRepository(AddedTeamsCount)
     private readonly addedTeamsCountRepository: Repository<AddedTeamsCount>,
-  ) {}
+  ) { }
 
   // Enhanced database query methods
   private async getAllTeams(): Promise<Teams[]> {
@@ -38,7 +38,7 @@ export class DatabaseQueryService {
 
   private async getTeamByName(name: string): Promise<Teams | null> {
     return await this.teamsRepository.findOne({
-      where: { name },
+      where: { name: ILike(`%${name}%`) }, // More flexible matching
       relations: ['homeMatches', 'awayMatches']
     });
   }
@@ -46,8 +46,8 @@ export class DatabaseQueryService {
   private async getMatchesByTeam(teamName: string): Promise<Matches[]> {
     return await this.matchesRepository.find({
       where: [
-        { homeTeamName: teamName },
-        { awayTeamName: teamName }
+        { homeTeamName: ILike(`%${teamName}%`) },
+        { awayTeamName: ILike(`%${teamName}%`) }
       ],
       relations: ['homeTeam', 'awayTeam']
     });
@@ -55,13 +55,12 @@ export class DatabaseQueryService {
 
   private async getMatchesByCompetition(competitionName: string): Promise<Matches[]> {
     return await this.matchesRepository.find({
-      where: { competitionName },
+      where: { competitionName: ILike(`%${competitionName}%`) },
       relations: ['homeTeam', 'awayTeam']
     });
   }
 
   private async getUpcomingMatches(): Promise<Matches[]> {
-    // Assuming matchTime is stored in a comparable format
     const now = new Date().toISOString();
     return await this.matchesRepository
       .createQueryBuilder('match')
@@ -69,6 +68,18 @@ export class DatabaseQueryService {
       .leftJoinAndSelect('match.awayTeam', 'awayTeam')
       .where('match.matchTime > :now', { now })
       .orderBy('match.matchTime', 'ASC')
+      .getMany();
+  }
+
+  private async getPastMatches(): Promise<Matches[]> {
+    const now = new Date().toISOString();
+    return await this.matchesRepository
+      .createQueryBuilder('match')
+      .leftJoinAndSelect('match.homeTeam', 'homeTeam')
+      .leftJoinAndSelect('match.awayTeam', 'awayTeam')
+      .where('match.matchTime < :now', { now })
+      .orderBy('match.matchTime', 'DESC')
+      .limit(50)
       .getMany();
   }
 
@@ -80,148 +91,238 @@ export class DatabaseQueryService {
     return await this.matchesRepository.count();
   }
 
+  private async getMatchesByDateRange(startDate: string, endDate: string): Promise<Matches[]> {
+    return await this.matchesRepository
+      .createQueryBuilder('match')
+      .leftJoinAndSelect('match.homeTeam', 'homeTeam')
+      .leftJoinAndSelect('match.awayTeam', 'awayTeam')
+      .where('match.matchTime BETWEEN :startDate AND :endDate', { startDate, endDate })
+      .orderBy('match.matchTime', 'ASC')
+      .getMany();
+  }
+
+  private async getDatabaseSchema(): Promise<{ teams: string[], competitions: string[] }> {
+    const teams = await this.teamsRepository
+      .createQueryBuilder('team')
+      .select('team.name')
+      .distinct(true)
+      .getRawMany();
+
+    const competitions = await this.matchesRepository
+      .createQueryBuilder('match')
+      .select('match.competitionName')
+      .distinct(true)
+      .where('match.competitionName IS NOT NULL')
+      .getRawMany();
+
+    return {
+      teams: teams.map(t => t.team_name),
+      competitions: competitions.map(c => c.match_competitionName)
+    };
+  }
+
+  private async analyzeQuestionWithAI(question: string): Promise<{
+    queryType: string;
+    entities: string[];
+    parameters: any;
+    confidence: number;
+  }> {
+    try {
+      const schema = await this.getDatabaseSchema();
+
+      const prompt = `You are a database query analyzer for a football/soccer database. 
+      
+Available data:
+- Teams: ${schema.teams.slice(0, 20).join(', ')}${schema.teams.length > 20 ? '...' : ''}
+- Competitions: ${schema.competitions.slice(0, 10).join(', ')}${schema.competitions.length > 10 ? '...' : ''}
+
+Available query types:
+1. team_matches - Get matches for specific teams
+2. upcoming_matches - Get future matches
+3. past_matches - Get historical matches
+4. competition_matches - Get matches from specific competitions
+5. teams_count - Count total teams
+6. matches_count - Count total matches
+7. all_teams - List all teams
+8. all_matches - List all matches (limited)
+9. date_range_matches - Get matches in a date range
+10. general - General query requiring multiple data types
+
+User Question: "${question}"
+
+Analyze this question and respond with ONLY a valid JSON object:
+{
+  "queryType": "one of the types above",
+  "entities": ["array of entity types needed: teams, matches, competitions"],
+  "parameters": {
+    "teamNames": ["extracted team names if any"],
+    "competitionNames": ["extracted competition names if any"],
+    "dateRange": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"} // if date range mentioned
+  },
+  "confidence": 0.85 // confidence level 0-1
+}
+
+Be smart about matching team/competition names even with partial matches or common abbreviations.`;
+
+      const response = await this.callOllama(prompt, 'gemma3:1b');
+
+      const cleanResponse = response
+        .replace(/```json/gi, '')
+        .replace(/```/g, '')
+        .trim();
+
+      try {
+        const analysis = JSON.parse(cleanResponse);
+        this.logger.log(`AI Analysis: ${JSON.stringify(analysis)}`);
+        return analysis;
+      } catch (parseError) {
+        this.logger.warn(`Failed to parse AI analysis response: ${cleanResponse}`);
+        return this.analyzeQuestion(question);
+      }
+    } catch (error) {
+      this.logger.warn(`AI analysis failed, falling back to rule-based: ${error.message}`);
+      return this.analyzeQuestion(question);
+    }
+  }
+
+  private async fetchRelevantDataWithAI(analysis: any): Promise<any> {
+    this.logger.log(`Fetching data for query type: ${analysis.queryType}`);
+
+    try {
+      // For complex queries, let AI decide what data to fetch
+      if (analysis.confidence < 0.7) {
+        const dataDecisionPrompt = `Based on this query analysis:
+Query Type: ${analysis.queryType}
+Parameters: ${JSON.stringify(analysis.parameters)}
+Confidence: ${analysis.confidence}
+
+What specific data should I fetch from the database? Respond with ONLY a JSON object:
+{
+  "primaryQuery": "main query to execute",
+  "additionalQueries": ["array of additional queries if needed"],
+  "limit": 50
+}
+
+Available queries: getAllTeams, getAllMatches, getTeamByName, getMatchesByTeam, getMatchesByCompetition, getUpcomingMatches, getPastMatches, getMatchesByDateRange`;
+
+        const decision = await this.callOllama(dataDecisionPrompt, 'gemma2:2b');
+
+        try {
+          const dataStrategy = JSON.parse(decision);
+          return await this.executeDataStrategy(dataStrategy, analysis.parameters);
+        } catch (parseError) {
+          this.logger.warn('Failed to parse data strategy, using default approach');
+        }
+      }
+
+      // Original logic for high-confidence queries
+      return await this.fetchRelevantData(analysis.queryType, analysis.parameters);
+
+    } catch (error) {
+      this.logger.warn(`AI data fetching failed, using fallback: ${error.message}`);
+      return await this.fetchRelevantData(analysis.queryType, analysis.parameters);
+    }
+  }
+
+
+  private async executeDataStrategy(strategy: any, parameters: any): Promise<any> {
+    const results: any = {};
+
+    // Execute primary query
+    switch (strategy.primaryQuery) {
+      case 'getAllTeams':
+        results.teams = await this.getAllTeams();
+        break;
+      case 'getAllMatches':
+        results.matches = (await this.getAllMatches()).slice(0, strategy.limit || 20);
+        break;
+      case 'getUpcomingMatches':
+        results.matches = await this.getUpcomingMatches();
+        break;
+      case 'getPastMatches':
+        results.matches = await this.getPastMatches();
+        break;
+      default:
+        results.matches = (await this.getAllMatches()).slice(0, 10);
+    }
+
+    // Execute additional queries if specified
+    if (strategy.additionalQueries) {
+      for (const query of strategy.additionalQueries) {
+        // Execute additional queries based on parameters
+        if (query === 'getTeamByName' && parameters.teamNames) {
+          results.teamDetails = await Promise.all(
+            parameters.teamNames.map((name: string) => this.getTeamByName(name))
+          );
+        }
+      }
+    }
+
+    return { type: 'ai_strategy', data: results };
+  }
+
   // Analyze question and determine what data to fetch
   private analyzeQuestion(question: string): {
     queryType: string;
     entities: string[];
-    parameters: string[];
+    parameters: any;
+    confidence: number;
   } {
     const lowerQuestion = question.toLowerCase();
-    
-    // Extract team names, competition names, etc.
-    const entities: string[] = [];
-    const parameters: string[] = [];
-    
-    // Common query types
+
     if (lowerQuestion.includes('team') && (lowerQuestion.includes('match') || lowerQuestion.includes('game'))) {
-      return { queryType: 'team_matches', entities: ['teams', 'matches'], parameters: this.extractTeamNames(question) };
+      return {
+        queryType: 'team_matches',
+        entities: ['teams', 'matches'],
+        parameters: { teamNames: this.extractTeamNames(question) },
+        confidence: 0.7
+      };
     }
-    
+
     if (lowerQuestion.includes('upcoming') || lowerQuestion.includes('next') || lowerQuestion.includes('future')) {
-      return { queryType: 'upcoming_matches', entities: ['matches'], parameters: [] };
+      return {
+        queryType: 'upcoming_matches',
+        entities: ['matches'],
+        parameters: {},
+        confidence: 0.8
+      };
     }
-    
+
     if (lowerQuestion.includes('competition') || lowerQuestion.includes('league') || lowerQuestion.includes('tournament')) {
-      return { queryType: 'competition_matches', entities: ['matches'], parameters: this.extractCompetitionNames(question) };
+      return {
+        queryType: 'competition_matches',
+        entities: ['matches'],
+        parameters: { competitionNames: this.extractCompetitionNames(question) },
+        confidence: 0.7
+      };
     }
-    
+
     if (lowerQuestion.includes('how many') || lowerQuestion.includes('count') || lowerQuestion.includes('total')) {
       if (lowerQuestion.includes('team')) {
-        return { queryType: 'teams_count', entities: ['teams'], parameters: [] };
+        return { queryType: 'teams_count', entities: ['teams'], parameters: {}, confidence: 0.9 };
       }
       if (lowerQuestion.includes('match') || lowerQuestion.includes('game')) {
-        return { queryType: 'matches_count', entities: ['matches'], parameters: [] };
+        return { queryType: 'matches_count', entities: ['matches'], parameters: {}, confidence: 0.9 };
       }
     }
-    
-    if (lowerQuestion.includes('all teams') || lowerQuestion.includes('list teams')) {
-      return { queryType: 'all_teams', entities: ['teams'], parameters: [] };
-    }
-    
-    if (lowerQuestion.includes('all matches') || lowerQuestion.includes('list matches')) {
-      return { queryType: 'all_matches', entities: ['matches'], parameters: [] };
-    }
-    
-    // Default: fetch relevant data based on entities mentioned
-    if (lowerQuestion.includes('team')) entities.push('teams');
-    if (lowerQuestion.includes('match') || lowerQuestion.includes('game')) entities.push('matches');
-    
-    return { queryType: 'general', entities, parameters: [] };
+
+    return { queryType: 'general', entities: ['teams', 'matches'], parameters: {}, confidence: 0.5 };
   }
 
   private extractTeamNames(question: string): string[] {
-    // This is a simple implementation - you might want to enhance this
-    // to match against actual team names in your database
     const words = question.split(' ');
     const teamNames: string[] = [];
-    
-    // Look for capitalized words that might be team names
+
     for (let i = 0; i < words.length; i++) {
       const word = words[i];
       if (word.length > 2 && word[0] === word[0].toUpperCase()) {
-        // Check if it might be a team name (you can enhance this logic)
         teamNames.push(word);
       }
     }
-    
+
     return teamNames;
   }
 
-  private extractCompetitionNames(question: string): string[] {
-    // Similar to extractTeamNames but for competitions
-    const competitions: string[] = [];
-    const lowerQuestion = question.toLowerCase();
-    
-    // Common competition keywords
-    const competitionKeywords = ['premier league', 'champions league', 'europa league', 'world cup', 'euro', 'copa'];
-    
-    competitionKeywords.forEach(keyword => {
-      if (lowerQuestion.includes(keyword)) {
-        competitions.push(keyword);
-      }
-    });
-    
-    return competitions;
-  }
-
-  // Fetch relevant data based on question analysis
-  private async fetchRelevantData(queryType: string, parameters: string[]): Promise<any> {
-    this.logger.log(`Fetching data for query type: ${queryType}, parameters: ${parameters.join(', ')}`);
-    
-    switch (queryType) {
-      case 'team_matches':
-        if (parameters.length > 0) {
-          const teamData = await Promise.all(
-            parameters.map(async (teamName) => {
-              const team = await this.getTeamByName(teamName);
-              const matches = await this.getMatchesByTeam(teamName);
-              return { team, matches };
-            })
-          );
-          return { type: 'team_matches', data: teamData };
-        }
-        break;
-        
-      case 'upcoming_matches':
-        const upcomingMatches = await this.getUpcomingMatches();
-        return { type: 'upcoming_matches', data: upcomingMatches };
-        
-      case 'competition_matches':
-        if (parameters.length > 0) {
-          const competitionMatches = await Promise.all(
-            parameters.map(comp => this.getMatchesByCompetition(comp))
-          );
-          return { type: 'competition_matches', data: competitionMatches.flat() };
-        }
-        break;
-        
-      case 'teams_count':
-        const teamsCount = await this.getTeamsCount();
-        return { type: 'teams_count', data: teamsCount };
-        
-      case 'matches_count':
-        const matchesCount = await this.getMatchesCount();
-        return { type: 'matches_count', data: matchesCount };
-        
-      case 'all_teams':
-        const allTeams = await this.getAllTeams();
-        return { type: 'all_teams', data: allTeams };
-        
-      case 'all_matches':
-        const allMatches = await this.getAllMatches();
-        return { type: 'all_matches', data: allMatches };
-        
-      default:
-        // General query - fetch teams and matches
-        const teams = await this.getAllTeams();
-        const matches = await this.getAllMatches();
-        return { type: 'general', data: { teams: teams.slice(0, 10), matches: matches.slice(0, 20) } };
-    }
-    
-    return { type: 'no_data', data: null };
-  }
-
-  // Convert database results to context string for Ollama
   private formatDataForContext(fetchedData: any): string {
     if (!fetchedData || !fetchedData.data) {
       return "No relevant data found in the database.";
@@ -230,98 +331,191 @@ export class DatabaseQueryService {
     let context = "";
 
     switch (fetchedData.type) {
-      case 'team_matches':
-        fetchedData.data.forEach((teamData: any, index: number) => {
-          if (teamData.team) {
-            context += `Team ${index + 1}: ${teamData.team.name}\n`;
-            if (teamData.team.image) context += `Image: ${teamData.team.image}\n`;
-            
-            if (teamData.matches && teamData.matches.length > 0) {
-              context += `Matches:\n`;
-              teamData.matches.forEach((match: Matches) => {
-                context += `- ${match.homeTeamName} vs ${match.awayTeamName}`;
-                if (match.matchTime) context += ` on ${match.matchTime}`;
-                if (match.competitionName) context += ` (${match.competitionName})`;
-                context += '\n';
-              });
-            }
-          }
-          context += '\n';
-        });
-        break;
-
-      case 'upcoming_matches':
-        context += "Upcoming Matches:\n";
-        fetchedData.data.forEach((match: Matches) => {
-          context += `- ${match.homeTeamName} vs ${match.awayTeamName}`;
-          if (match.matchTime) context += ` on ${match.matchTime}`;
-          if (match.competitionName) context += ` (${match.competitionName})`;
-          context += '\n';
-        });
-        break;
-
-      case 'competition_matches':
-        context += "Competition Matches:\n";
-        fetchedData.data.forEach((match: Matches) => {
-          context += `- ${match.homeTeamName} vs ${match.awayTeamName}`;
-          if (match.matchTime) context += ` on ${match.matchTime}`;
-          context += '\n';
-        });
-        break;
-
-      case 'teams_count':
-        context += `Total number of teams in the database: ${fetchedData.data}`;
-        break;
-
-      case 'matches_count':
-        context += `Total number of matches in the database: ${fetchedData.data}`;
-        break;
-
-      case 'all_teams':
-        context += "All Teams:\n";
-        fetchedData.data.forEach((team: Teams) => {
-          context += `- ${team.name}`;
-          if (team.image) context += ` (Image: ${team.image})`;
-          context += '\n';
-        });
-        break;
-
-      case 'all_matches':
-        context += "All Matches:\n";
-        fetchedData.data.forEach((match: Matches) => {
-          context += `- ${match.homeTeamName} vs ${match.awayTeamName}`;
-          if (match.matchTime) context += ` on ${match.matchTime}`;
-          if (match.competitionName) context += ` (${match.competitionName})`;
-          context += '\n';
-        });
-        break;
-
-      case 'general':
+      case 'ai_strategy':
         if (fetchedData.data.teams) {
           context += "Teams:\n";
-          fetchedData.data.teams.forEach((team: Teams) => {
+          fetchedData.data.teams.slice(0, 20).forEach((team: Teams) => {
             context += `- ${team.name}\n`;
           });
           context += '\n';
         }
         if (fetchedData.data.matches) {
-          context += "Recent Matches:\n";
+          context += "Matches:\n";
+          fetchedData.data.matches.slice(0, 30).forEach((match: Matches) => {
+            context += `- ${match.homeTeamName} vs ${match.awayTeamName}`;
+            if (match.matchTime) context += ` on ${match.matchTime}`;
+            if (match.competitionName) context += ` (${match.competitionName})`;
+            context += '\n';
+          });
+        }
+        if (fetchedData.data.teamDetails) {
+          context += "\nTeam Details:\n";
+          fetchedData.data.teamDetails.forEach((team: Teams) => {
+            if (team) {
+              context += `- ${team.name}`;
+              if (team.image) context += ` (Image: ${team.image})`;
+              context += '\n';
+            }
+          });
+        }
+        break;
+
+      case 'past_matches':
+        context += "Recent Past Matches:\n";
+        fetchedData.data.forEach((match: Matches) => {
+          context += `- ${match.homeTeamName} vs ${match.awayTeamName}`;
+          if (match.matchTime) context += ` on ${match.matchTime}`;
+          if (match.competitionName) context += ` (${match.competitionName})`;
+          context += '\n';
+        });
+        break;
+
+      case 'date_range_matches':
+        context += "Matches in Date Range:\n";
+        fetchedData.data.forEach((match: Matches) => {
+          context += `- ${match.homeTeamName} vs ${match.awayTeamName}`;
+          if (match.matchTime) context += ` on ${match.matchTime}`;
+          if (match.competitionName) context += ` (${match.competitionName})`;
+          context += '\n';
+        });
+        break;
+
+      // ... (keep all other existing cases from the original formatDataForContext method)
+
+      default:
+        // Handle any other cases or fallback
+        if (fetchedData.data.teams) {
+          context += "Teams:\n";
+          fetchedData.data.teams.forEach((team: Teams) => {
+            context += `- ${team.name}\n`;
+          });
+        }
+        if (fetchedData.data.matches) {
+          context += "Matches:\n";
           fetchedData.data.matches.forEach((match: Matches) => {
             context += `- ${match.homeTeamName} vs ${match.awayTeamName}`;
             if (match.competitionName) context += ` (${match.competitionName})`;
             context += '\n';
           });
         }
-        break;
-
-      default:
-        context = "No relevant data found for your question.";
     }
 
     return context;
   }
 
+  private extractCompetitionNames(question: string): string[] {
+    const competitions: string[] = [];
+    const lowerQuestion = question.toLowerCase();
+
+    const competitionKeywords = ['premier league', 'champions league', 'europa league', 'world cup', 'euro', 'copa'];
+
+    competitionKeywords.forEach(keyword => {
+      if (lowerQuestion.includes(keyword)) {
+        competitions.push(keyword);
+      }
+    });
+
+    return competitions;
+  }
+
+  // Fetch relevant data based on question analysis
+  private async fetchRelevantData(queryType: string, parameters: any): Promise<any> {
+    switch (queryType) {
+      case 'team_matches':
+        if (parameters.teamNames && parameters.teamNames.length > 0) {
+          const teamData = await Promise.all(
+            parameters.teamNames.map(async (teamName: string) => {
+              const team = await this.getTeamByName(teamName);
+              const matches = await this.getMatchesByTeam(teamName);
+              return { team, matches };
+            })
+          );
+          return { type: 'team_matches', data: teamData };
+        }
+        break;
+
+      case 'upcoming_matches':
+        const upcomingMatches = await this.getUpcomingMatches();
+        return { type: 'upcoming_matches', data: upcomingMatches };
+
+      case 'past_matches':
+        const pastMatches = await this.getPastMatches();
+        return { type: 'past_matches', data: pastMatches };
+
+      case 'competition_matches':
+        if (parameters.competitionNames && parameters.competitionNames.length > 0) {
+          const competitionMatches = await Promise.all(
+            parameters.competitionNames.map((comp: string) => this.getMatchesByCompetition(comp))
+          );
+          return { type: 'competition_matches', data: competitionMatches.flat() };
+        }
+        break;
+
+      case 'date_range_matches':
+        if (parameters.dateRange) {
+          const matches = await this.getMatchesByDateRange(
+            parameters.dateRange.start,
+            parameters.dateRange.end
+          );
+          return { type: 'date_range_matches', data: matches };
+        }
+        break;
+
+      case 'teams_count':
+        const teamsCount = await this.getTeamsCount();
+        return { type: 'teams_count', data: teamsCount };
+
+      case 'matches_count':
+        const matchesCount = await this.getMatchesCount();
+        return { type: 'matches_count', data: matchesCount };
+
+      case 'all_teams':
+        const allTeams = await this.getAllTeams();
+        return { type: 'all_teams', data: allTeams };
+
+      case 'all_matches':
+        const allMatches = await this.getAllMatches();
+        return { type: 'all_matches', data: allMatches.slice(0, 50) };
+
+      default:
+        const teams = await this.getAllTeams();
+        const matches = await this.getAllMatches();
+        return { type: 'general', data: { teams: teams.slice(0, 10), matches: matches.slice(0, 20) } };
+    }
+
+    return { type: 'no_data', data: null };
+  }
+
+  private async callOllama(prompt: string, model = 'gemma2:2b'): Promise<string> {
+    const response = await fetch('http://localhost:11434/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: model,
+        prompt: prompt,
+        stream: false,
+        options: {
+          temperature: 0.1, // Low temperature for more consistent analysis
+          top_p: 0.9,
+        }
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Ollama request failed: ${response.status}`);
+    }
+
+    const data = await response.json();
+    return data.response.trim();
+  }
+
+  // Convert database results to context string for Ollama
+
+
   // Ollama integration (similar to your existing AskService)
+
+
+
   private async askOllama(question: string, context: string): Promise<string> {
     try {
       const prompt = `You are a helpful assistant that answers questions about football/soccer teams and matches based on the provided database information.
@@ -340,7 +534,7 @@ Instructions:
 
 Answer:`;
 
-      const modelNames = ['gemma3:1b'];
+      const modelNames = ['gemma2:2b', 'gemma3:1b'];
       let lastError: Error;
 
       for (const modelName of modelNames) {
@@ -349,9 +543,7 @@ Answer:`;
 
           const response = await fetch('http://localhost:11434/api/generate', {
             method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               model: modelName,
               prompt: prompt,
@@ -361,7 +553,6 @@ Answer:`;
 
           if (response.ok) {
             const data = await response.json();
-
             if (data.response) {
               this.logger.log(`Successfully used model: ${modelName}`);
               return data.response.trim();
@@ -387,46 +578,58 @@ Answer:`;
       throw new Error(`Ollama LLM failed: ${error.message}`);
     }
   }
-
   // Main method to handle database queries with Ollama
-  async queryDatabaseWithAI(question: string, includeContext = false): Promise<{ answer: string; context?: string }> {
+
+
+  async queryDatabaseWithAI(question: string, includeContext = false): Promise<{
+    answer: string;
+    context?: string;
+    analysis?: any;
+  }> {
     const requestId = `db-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    this.logger.log(`Starting database query for request ${requestId}: ${question}`);
+    this.logger.log(`Starting AI-powered database query for request ${requestId}: ${question}`);
 
     try {
-      // Step 1: Analyze the question
-      this.logger.log('Step 1: Analyzing question...');
-      const analysis = this.analyzeQuestion(question);
+      // Step 1: AI-powered question analysis
+      this.logger.log('Step 1: AI analyzing question...');
+      const analysis = await this.analyzeQuestionWithAI(question);
 
-      // Step 2: Fetch relevant data
-      this.logger.log('Step 2: Fetching relevant data from database...');
-      const fetchedData = await this.fetchRelevantData(analysis.queryType, analysis.parameters);
+      // Step 2: AI-powered data fetching
+      this.logger.log('Step 2: AI determining data fetching strategy...');
+      const fetchedData = await this.fetchRelevantDataWithAI(analysis);
 
       // Step 3: Format data for context
       this.logger.log('Step 3: Formatting data for AI context...');
       const context = this.formatDataForContext(fetchedData);
 
-      // Step 4: Get answer from Ollama
+      // Step 4: Get final answer from Ollama
       this.logger.log('Step 4: Getting AI response...');
       const answer = await this.askOllama(question, context);
 
-      this.logger.log(`Successfully completed database query for request ${requestId}`);
-      
-      const result: { answer: string; context?: string } = { answer };
+      this.logger.log(`Successfully completed AI-powered database query for request ${requestId}`);
+
+      const result: { answer: string; context?: string; analysis?: any } = { answer };
       if (includeContext) {
         result.context = context;
+        result.analysis = analysis;
       }
 
       return result;
 
     } catch (error) {
-      this.logger.error(`Database query request ${requestId} failed: ${error.message}`);
+      this.logger.error(`AI-powered database query request ${requestId} failed: ${error.message}`);
       throw error;
     }
   }
 
+
+
   // Utility method to check Ollama availability
-  async checkOllamaAvailability(): Promise<{ available: boolean; models: string[] }> {
+  async checkOllamaAvailability(): Promise<{
+    available: boolean;
+    models: string[];
+    recommendedModels: string[];
+  }> {
     try {
       const response = await fetch('http://localhost:11434/api/tags', {
         method: 'GET',
@@ -436,13 +639,17 @@ Answer:`;
       if (response.ok) {
         const data = await response.json();
         const models = data.models ? data.models.map((m: any) => m.name) : [];
-        return { available: true, models };
+        const recommendedModels = models.filter((model: string) =>
+          ['gemma2:2b', 'gemma3:1b', 'llama3.2:1b', 'qwen2.5:1.5b'].includes(model)
+        );
+
+        return { available: true, models, recommendedModels };
       }
 
-      return { available: false, models: [] };
+      return { available: false, models: [], recommendedModels: [] };
     } catch (error) {
       this.logger.error(`Ollama availability check failed: ${error.message}`);
-      return { available: false, models: [] };
+      return { available: false, models: [], recommendedModels: [] };
     }
   }
 }
